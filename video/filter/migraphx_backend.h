@@ -47,6 +47,19 @@
  * finishes the state becomes BYPASS(PLAN_COMPILED); the plan takes effect at the next mgb_reset() (the session then goes
  * INITIALIZING -> READY).
  *
+ * Zero-copy VA-API input (feature MGB_FEATURE_VAAPI_INPUT, same ABI version 1; see mgb_features()). Instead of host
+ * frames the caller can submit decoder surfaces of a VADisplay (mpv hwdec=vaapi). The session then owns a pool of
+ * linear NV12 device buffers that are also VA surfaces; for each submitted surface the worker thread runs a VA-API
+ * video-processing blit into one of them (this converts P010 -> NV12 and shrinks frames wider than 1920 the way the
+ * engine would), waits for it with vaSyncSurface (HIP ignores dma-buf implicit sync) and lets the engine read the
+ * buffer in place: no download, no host copy, no upload. libva is loaded with dlopen by the backend; the caller only
+ * passes the VADisplay pointer and the VASurfaceID. Enable it with mgb_open_params_t.va_display or mgb_reconfigure_va().
+ * In this mode every pair returns an ORIGINAL result (the converted first frame, NV12 at the output size) because the
+ * decoder surface itself is not shown by the caller (a hardware frame in a stream of system-memory midpoints would
+ * make the VO reconfigure on every frame). mgb_acquire_input()/mgb_submit()/mgb_submit_frame() return MGB_BYPASS
+ * in this mode. If the VA objects can not be created the state is BYPASS(MGB_BYPASS_VA_FAILED): reconfigure without
+ * a display and submit host frames (e.g. downloaded with av_hwframe_transfer_data).
+ *
  * Size or format change: mgb_reconfigure() (also triggered by mgb_submit() with a different size) destroys the engine and
  * creates a new one for the new size (one engine per plan size, never two at once); it bumps the epoch.
  */
@@ -65,6 +78,9 @@ extern "C" {
 #endif
 
 #define MGB_ABI_VERSION 1
+
+/** mgb_features() bits. A newer backend only adds symbols and trailing struct fields; version 1 callers keep working. */
+#define MGB_FEATURE_VAAPI_INPUT 1 /**< mgb_va_submit(), mgb_reconfigure_va(), mgb_open_params_t.va_display */
 
 /** Return codes. Negative values are errors. */
 #define MGB_OK        0   /**< done; for mgb_fetch: a result was returned */
@@ -88,6 +104,7 @@ extern "C" {
 #define MGB_BYPASS_COMPILING     2 /**< no plan yet; being compiled in the background */
 #define MGB_BYPASS_PLAN_COMPILED 3 /**< the plan now exists; takes effect at the next mgb_reset() */
 #define MGB_BYPASS_UNSUPPORTED   4 /**< format or size the engine can not do (not 4:2:0 NV12/P010, odd or tiny size) */
+#define MGB_BYPASS_VA_FAILED     5 /**< the zero-copy VA-API input could not be set up (libva, dma-buf export or import failed) */
 
 /** Pixel formats (same values as the engine's migraphx_pix_fmt_t). */
 #define MGB_PIX_NV12 0 /**< 8 bit; Y plane then interleaved CbCr (height / 2 rows) */
@@ -124,7 +141,16 @@ typedef struct mgb_open_params {
     void* wakeup_ctx;
     const char* compile_script;    /**< tools/compile_mxr.sh; NULL: <dir of this library>/../tools/compile_mxr.sh */
     const char* exporter;          /**< migraphx-vfi-export-stages; NULL: <dir of this library>/migraphx-vfi-export-stages */
+    /* fields below exist only when struct_size covers them (feature MGB_FEATURE_VAAPI_INPUT) */
+    void* va_display;              /**< VADisplay of the decoder: zero-copy VA-API input; width/height/fmt describe the decoder surfaces. NULL: host frames */
 } mgb_open_params_t;
+
+/** A decoder surface for mgb_va_submit(). */
+typedef struct mgb_va_frame {
+    uint32_t struct_size;          /**< sizeof(mgb_va_frame_t) */
+    uint32_t surface;              /**< VASurfaceID */
+    int width, height;             /**< the picture (not the padded surface: 1080, not 1088); must equal the session's source size */
+} mgb_va_frame_t;
 
 /** An input buffer from mgb_acquire_input(). Valid until submitted (or the session is closed). */
 typedef struct mgb_slot {
@@ -168,9 +194,15 @@ typedef struct mgb_stats {
     int out_w, out_h;
     int scaled;                    /**< 1: the engine shrinks/converts and ORIGINAL results exist */
     char plan[48];
+    /* VA-API input (MGB_FEATURE_VAAPI_INPUT) */
+    int va_input;                  /**< 1: the session takes decoder surfaces */
+    uint64_t va_blits;
+    double avg_blit_ms, max_blit_ms; /**< worker time per frame: blit + vaSyncSurface (includes waiting for the decode) */
 } mgb_stats_t;
 
 MGB_API int mgb_abi_version(void);
+/** Bit set of MGB_FEATURE_*; absent (dlsym fails) in backends built before the features existed. */
+MGB_API int mgb_features(void);
 
 /** Fill defaults: struct_size, abi_version, model "4.26", NV12, scene_threshold -1, queue_depth 4, log_level -1. */
 MGB_API void mgb_open_params_init(mgb_open_params_t* params);
@@ -190,6 +222,17 @@ MGB_API uint32_t mgb_epoch(mgb_session*);
 MGB_API int mgb_acquire_input(mgb_session*, mgb_slot_t* out);
 /** Hand a filled buffer to the GPU. pts: caller's unit. Returns MGB_OK, MGB_STALE (epoch is old; frame dropped), MGB_E_ARG. */
 MGB_API int mgb_submit(mgb_session*, const mgb_slot_t* slot, int64_t pts, uint32_t epoch);
+/** Zero-copy VA-API input. Hand a decoder surface to the worker. MGB_OK: taken; `release(release_user)` is called exactly
+ *  once, from the worker thread (or from mgb_reset/mgb_reconfigure_va/mgb_close), when the backend no longer touches the
+ *  surface; it must be thread-safe and must not call mgb_*. Anything else (MGB_BUSY, MGB_BYPASS, MGB_STALE, MGB_E_ARG,
+ *  MGB_E_FAILED): not taken, release is not called. Not blocking. */
+MGB_API int mgb_va_submit(mgb_session*, const mgb_va_frame_t* frame, int64_t pts, uint32_t epoch, void (*release)(void*), void* release_user);
+/** Like mgb_reconfigure() and also selects the input mode: va_display != NULL for decoder surfaces of that VADisplay
+ *  (width/height/fmt are the picture size and its P010/NV12 format), NULL for host frames. Does nothing (returns the
+ *  epoch) if nothing changed. The display must stay valid until mgb_close() or a later reconfigure has been followed by
+ *  a state change (the worker destroys its VA objects on the old display). */
+MGB_API uint32_t mgb_reconfigure_va(mgb_session*, int width, int height, int fmt, void* va_display);
+
 /** Give an acquired buffer back without submitting it. */
 MGB_API void mgb_cancel_input(mgb_session*, const mgb_slot_t* slot);
 /** Convenience: acquire, copy the planes (strides in bytes), submit. width/height/fmt that differ from the session's trigger
