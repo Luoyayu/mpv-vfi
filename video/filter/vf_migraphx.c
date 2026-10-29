@@ -36,11 +36,13 @@
  *    device buffer with VA-API video processing (P010 -> NV12 and shrinking included) and the engine reads that buffer
  *    in place: no hwdownload, no memcpy, no upload. process() stays non-blocking (the blit and the wait for the
  *    decoder happen on the worker). The filter holds its own reference to the frame until the backend says it is done
- *    with the surface. Every output frame stays a system-memory NV12 frame: the midpoints are, and the converted
- *    originals come back from the backend, because a hardware frame between system-memory frames would make the VO
- *    reconfigure each time the format flips. When the frames are passed through (bypass states) they are downloaded
- *    first, so the output format never depends on the path. option zero-copy=no restores the old route
- *    (autoconvert downloads the frames).
+ *    with the surface. Interpolated output (the midpoints and the converted originals that come back from the backend)
+ *    is system-memory NV12: a hardware frame between system-memory frames would make the VO reconfigure on every
+ *    frame, so the originals are not passed on as VAAPI frames. Frames that are passed through (bypass states: engine
+ *    starting, post-seek pre-roll, overload, unsupported colors) stay VAAPI frames untouched, which costs nothing
+ *    (downloading a 4K P010 frame takes about 8 ms on the filter thread); the VO reconfigures only when the stream
+ *    switches between the two, as it already did for 10-bit sources (P010 pass-through, NV12 output). option
+ *    zero-copy=no restores the old route (autoconvert downloads the frames).
  *  - reset (seek): the queue is dropped and mgb_reset() starts a new epoch; the first frame after a seek has no
  *    midpoint before it.
  */
@@ -952,16 +954,6 @@ static bool write_through(struct priv *p, struct mp_image *mpi)
 {
     if (!mp_pin_in_needs_data(p->f->ppins[1]))
         return false;
-    if (mpi->imgfmt == IMGFMT_VAAPI) {
-        // Pass-through frames are system memory like everything else this filter outputs (no format flips for the VO).
-        struct mp_image *sw = mp_image_hw_download(mpi, NULL);
-        mp_image_unrefp(&mpi);
-        if (!sw) {
-            MP_ERR(p, "downloading a VAAPI frame failed, dropping it\n");
-            return true;
-        }
-        mpi = sw;
-    }
     p->n_pass++;
     MP_TRACE(p, "pass pts %.6f\n", mpi->pts);
     if (p->overloaded && ++p->overload_pass >= p->overload_pass_target) {
@@ -1115,7 +1107,7 @@ static bool read_input(struct priv *p)
         if (!was_held)   // (a held frame was already counted when it was first read)
             preroll_note_read(p, mpi);
         if (mpi->imgfmt == IMGFMT_VAAPI && !zc_possible(p, mpi)) {
-            // Not usable as a surface (option off, backend without the feature, setup failed, other sub-format).
+            // Not usable as a surface (backend without the feature, setup failed, other sub-format): download.
             struct mp_image *sw = mp_image_hw_download(mpi, NULL);
             mp_image_unrefp(&mpi);
             if (!sw) {
