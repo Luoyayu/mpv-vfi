@@ -770,6 +770,13 @@ if features['vapoursynth']
     sources += files('video/filter/vf_vapoursynth.c')
 endif
 
+# vf_migraphx has no build-time dependency: it dlopen()s libmigraphx_vfi_backend.so at run time.
+migraphx_opt = get_option('migraphx').require(features['libdl'], error_message: 'vf_migraphx needs dlopen()')
+features += {'migraphx': migraphx_opt.allowed()}
+if features['migraphx']
+    sources += files('video/filter/vf_migraphx.c')
+endif
+
 xfixes = dependency('xfixes', version: '>= 1.0.0', required: get_option('x11-clipboard'))
 libx11 = dependency('x11', version: '>= 1.0.0', required: get_option('x11-clipboard'))
 features += {'x11-clipboard': xfixes.found() and libx11.found()}

@@ -32,6 +32,7 @@ option('sdl2-gamepad', type: 'feature', value: 'disabled', description: 'SDL2 ga
 option('uchardet', type: 'feature', value: 'auto', description: 'uchardet support')
 option('uwp', type: 'feature', value: 'disabled', description: 'Universal Windows Platform')
 option('vapoursynth', type: 'feature', value: 'auto', description: 'VapourSynth filter bridge')
+option('migraphx', type: 'feature', value: 'auto', description: 'MIGraphX RIFE frame interpolation filter (vf_migraphx; loads libmigraphx_vfi_backend.so at run time)')
 option('vector', type: 'feature', value: 'auto', description: 'GCC vector instructions')
 option('win32-threads', type: 'feature', value: 'auto', description: 'win32 native threading')
 option('x11-clipboard', type: 'feature', value: 'auto', description: 'X11 clipboard backend')
