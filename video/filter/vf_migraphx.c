@@ -31,9 +31,21 @@
  *  - A bypass (the backend is initializing, has no plan, the format is unsupported, the source frame rate is above
  *    max-fps, the GPU does not keep up) passes frames through unchanged. A failed session fails the filter, which
  *    makes mpv disable it and play on.
+ *  - Zero-copy input (hwdec=vaapi): VAAPI frames are accepted as they are. The filter hands the VADisplay and the
+ *    VASurfaceID to the backend (mgb_va_submit), whose worker thread blits the decoder surface into a linear NV12
+ *    device buffer with VA-API video processing (P010 -> NV12 and shrinking included) and the engine reads that buffer
+ *    in place: no hwdownload, no memcpy, no upload. process() stays non-blocking (the blit and the wait for the
+ *    decoder happen on the worker). The filter holds its own reference to the frame until the backend says it is done
+ *    with the surface. Every output frame stays a system-memory NV12 frame: the midpoints are, and the converted
+ *    originals come back from the backend, because a hardware frame between system-memory frames would make the VO
+ *    reconfigure each time the format flips. When the frames are passed through (bypass states) they are downloaded
+ *    first, so the output format never depends on the path. option zero-copy=no restores the old route
+ *    (autoconvert downloads the frames).
  *  - reset (seek): the queue is dropped and mgb_reset() starts a new epoch; the first frame after a seek has no
  *    midpoint before it.
  */
+
+#include "config.h"
 
 #include <dlfcn.h>
 #include <inttypes.h>
@@ -55,6 +67,13 @@
 #include "osdep/timer.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
+#include "video/mp_image_pool.h"
+
+#if HAVE_VAAPI
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vaapi.h>
+#include "video/vaapi.h"
+#endif
 
 #include "migraphx_backend.h"
 
@@ -76,6 +95,7 @@ struct migraphx_opts {
     bool compile;
     bool wait_ready;
     bool preroll_bypass;
+    bool zero_copy;
 };
 
 struct backend_api {
@@ -96,6 +116,10 @@ struct backend_api {
     void (*release_output)(mgb_session *, const mgb_result_t *);
     uint32_t (*reset)(mgb_session *);
     uint32_t (*reconfigure)(mgb_session *, int, int, int);
+    // optional (feature MGB_FEATURE_VAAPI_INPUT)
+    int (*features)(void);
+    int (*va_submit)(mgb_session *, const mgb_va_frame_t *, int64_t, uint32_t, void (*)(void *), void *);
+    uint32_t (*reconfigure_va)(mgb_session *, int, int, int, void *);
     int (*get_stats)(mgb_session *, mgb_stats_t *);
     void (*close)(mgb_session *);
 };
@@ -127,6 +151,11 @@ struct priv {
     struct mp_image_params cfg;
     bool cfg_valid;
     int mgb_fmt;
+    bool zc;                  // the session takes VAAPI decoder surfaces (zero-copy input)
+    bool zc_failed;           // the backend could not set it up: download the frames instead, for good
+    void *va_display;         // VADisplay of the current VAAPI frames
+    struct AVBufferRef **va_devs;   // references that keep every VADisplay used alive until the session is closed
+    int n_va_devs;
     char *pass_reason;        // non-NULL: this format is passed through for good (until reconfigured)
     bool scaled;              // the backend returns ORIGINAL frames
     int out_w, out_h;
@@ -218,6 +247,12 @@ static bool resolve_backend(struct priv *p, void *handle, const char *path)
     LOAD_SYM(reconfigure);
     LOAD_SYM(get_stats);
     LOAD_SYM(close);
+    // Optional zero-copy VA-API input.
+    *(void **)&be->features = dlsym(handle, "mgb_features");
+    *(void **)&be->va_submit = dlsym(handle, "mgb_va_submit");
+    *(void **)&be->reconfigure_va = dlsym(handle, "mgb_reconfigure_va");
+    if (!be->features || !be->va_submit || !be->reconfigure_va || !(be->features() & MGB_FEATURE_VAAPI_INPUT))
+        be->va_submit = NULL;
     return true;
 }
 
@@ -461,11 +496,75 @@ static void close_session(struct priv *p)
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// VAAPI input
+
+#if HAVE_VAAPI
+static void *va_display_of(struct mp_image *mpi)
+{
+    if (mpi->imgfmt != IMGFMT_VAAPI || !mpi->hwctx)
+        return NULL;
+    AVHWFramesContext *fc = (void *)mpi->hwctx->data;
+    if (!fc->device_ctx || fc->device_ctx->type != AV_HWDEVICE_TYPE_VAAPI || !fc->device_ctx->hwctx)
+        return NULL;
+    return ((AVVAAPIDeviceContext *)fc->device_ctx->hwctx)->display;
+}
+
+// Called by the backend from its worker thread once it no longer reads the decoder surface.
+static void release_mpi(void *ctx)
+{
+    struct mp_image *m = ctx;
+    mp_image_unrefp(&m);
+}
+
+// The backend destroys its VA objects on the display when the session is reconfigured or closed; keep every display
+// that was used alive until the session is closed.
+static void keep_device(struct priv *p, struct mp_image *mpi)
+{
+    AVHWFramesContext *fc = (void *)mpi->hwctx->data;
+    for (int i = 0; i < p->n_va_devs; i++)
+        if (p->va_devs[i]->data == fc->device_ref->data)
+            return;
+    struct AVBufferRef *ref = av_buffer_ref(fc->device_ref);
+    if (ref)
+        MP_TARRAY_APPEND(p, p->va_devs, p->n_va_devs, ref);
+}
+
+static void release_devices(struct priv *p)
+{
+    for (int i = 0; i < p->n_va_devs; i++)
+        av_buffer_unref(&p->va_devs[i]);
+    p->n_va_devs = 0;
+}
+#else
+static void *va_display_of(struct mp_image *mpi) { return NULL; }
+static void keep_device(struct priv *p, struct mp_image *mpi) {}
+static void release_devices(struct priv *p) {}
+#endif
+
+// Can this VAAPI frame go to the backend as a surface? Otherwise the caller downloads it.
+static bool zc_possible(struct priv *p, struct mp_image *mpi)
+{
+    if (mpi->imgfmt != IMGFMT_VAAPI || !HAVE_VAAPI || !p->opts->zero_copy || p->zc_failed)
+        return false;
+    if (mpi->params.hw_subfmt != IMGFMT_NV12 && mpi->params.hw_subfmt != IMGFMT_P010)
+        return false;
+    if (!va_display_of(mpi))
+        return false;
+    if (!p->be_loaded) {
+        p->slow_call = true;
+        if (!load_backend(p))
+            return false;
+    }
+    return p->be.va_submit != NULL;
+}
+
 // Why this frame format must be passed through (NULL: fine).
 static char *unsupported_reason(struct priv *p, struct mp_image *mpi)
 {
-    if (mpi->imgfmt != IMGFMT_NV12 && mpi->imgfmt != IMGFMT_P010)
-        return talloc_asprintf(p, "pixel format %s is not NV12/P010", mp_imgfmt_to_name(mpi->imgfmt));
+    int fmt = mpi->imgfmt == IMGFMT_VAAPI ? mpi->params.hw_subfmt : mpi->imgfmt;
+    if (fmt != IMGFMT_NV12 && fmt != IMGFMT_P010)
+        return talloc_asprintf(p, "pixel format %s is not NV12/P010", mp_imgfmt_to_name(fmt));
     if (mpi->nominal_fps > p->opts->max_fps + 0.001)
         return talloc_asprintf(p, "source frame rate %.3f is above max-fps %.3f", mpi->nominal_fps,
                                p->opts->max_fps);
@@ -482,7 +581,9 @@ static char *unsupported_reason(struct priv *p, struct mp_image *mpi)
 static bool params_changed(struct priv *p, struct mp_image *mpi)
 {
     return !p->cfg_valid || mpi->imgfmt != p->cfg.imgfmt || mpi->w != p->cfg.w || mpi->h != p->cfg.h ||
-           mpi->params.p_w != p->cfg.p_w || mpi->params.p_h != p->cfg.p_h;
+           mpi->params.p_w != p->cfg.p_w || mpi->params.p_h != p->cfg.p_h ||
+           mpi->params.hw_subfmt != p->cfg.hw_subfmt ||
+           (mpi->imgfmt == IMGFMT_VAAPI && va_display_of(mpi) != p->va_display);
 }
 
 static const char *models_dir(struct priv *p, char *buf, size_t size)
@@ -526,6 +627,10 @@ static void note_state(struct priv *p, int st, int reason)
     }
     case MGB_STATE_BYPASS:
         switch (reason) {
+        case MGB_BYPASS_VA_FAILED:
+            MP_WARN(p, "zero-copy VA-API input is unavailable (%s); downloading the frames instead\n", err ? err : "?");
+            p->zc_failed = true;
+            break;
         case MGB_BYPASS_NO_PLAN:
             log_bypass(p, "no plan for %dx%d (%s)", p->cfg.w, p->cfg.h, err ? err : "compiling is off");
             break;
@@ -549,12 +654,19 @@ static void note_state(struct priv *p, int st, int reason)
 
 static bool open_or_reconfigure(struct priv *p, struct mp_image *mpi)
 {
-    p->mgb_fmt = mpi->imgfmt == IMGFMT_P010 ? MGB_PIX_P010 : MGB_PIX_NV12;
+    p->zc = mpi->imgfmt == IMGFMT_VAAPI;
+    void *dpy = p->zc ? va_display_of(mpi) : NULL;
+    int sfmt = p->zc ? mpi->params.hw_subfmt : mpi->imgfmt;
+    p->mgb_fmt = sfmt == IMGFMT_P010 ? MGB_PIX_P010 : MGB_PIX_NV12;
+    p->va_display = dpy;
+    if (p->zc)
+        keep_device(p, mpi);
     p->scaled = false;
     p->last_st = p->last_reason = -1;
     if (p->sess) {
-        p->epoch = p->be.reconfigure(p->sess, mpi->w, mpi->h, p->mgb_fmt);
-        MP_VERBOSE(p, "reconfigure %dx%d, epoch %u\n", mpi->w, mpi->h, p->epoch);
+        p->epoch = p->be.va_submit ? p->be.reconfigure_va(p->sess, mpi->w, mpi->h, p->mgb_fmt, dpy)
+                                   : p->be.reconfigure(p->sess, mpi->w, mpi->h, p->mgb_fmt);
+        MP_VERBOSE(p, "reconfigure %dx%d %s, epoch %u\n", mpi->w, mpi->h, p->zc ? "(VAAPI surfaces)" : "", p->epoch);
         return true;
     }
     p->slow_call = true;
@@ -577,8 +689,10 @@ static bool open_or_reconfigure(struct priv *p, struct mp_image *mpi)
     op.log_level = lvl >= MSGL_DEBUG ? 3 : lvl >= MSGL_V ? 2 : 1;
     op.wakeup = backend_wakeup;
     op.wakeup_ctx = p->f;
-    MP_VERBOSE(p, "opening a session: models %s, model %s, %dx%d %s\n", op.model_dir, op.model ? op.model : "4.26",
-               mpi->w, mpi->h, p->mgb_fmt == MGB_PIX_P010 ? "P010" : "NV12");
+    if (p->be.va_submit)
+        op.va_display = dpy;
+    MP_VERBOSE(p, "opening a session: models %s, model %s, %dx%d %s%s\n", op.model_dir, op.model ? op.model : "4.26",
+               mpi->w, mpi->h, p->mgb_fmt == MGB_PIX_P010 ? "P010" : "NV12", p->zc ? " (VAAPI surfaces, zero-copy)" : "");
     p->sess = p->be.open(&op);
     if (!p->sess) {
         MP_ERR(p, "mgb_open failed (invalid parameters or ABI mismatch)\n");
@@ -748,6 +862,23 @@ enum submit_result { SUBMIT_OK, SUBMIT_BUSY, SUBMIT_NOT_TAKEN };
 
 static enum submit_result try_submit(struct priv *p, struct mp_image *mpi)
 {
+#if HAVE_VAAPI
+    if (p->zc) {
+        // The backend blits the surface on its worker thread; it keeps the frame alive through its own reference.
+        mgb_va_frame_t vf = {.struct_size = sizeof(vf), .surface = va_surface_id(mpi), .width = mpi->w, .height = mpi->h};
+        struct mp_image *ref = mp_image_new_ref(mpi);
+        if (!ref)
+            return SUBMIT_NOT_TAKEN;
+        int rc = p->be.va_submit(p->sess, &vf, llrint(mpi->pts * 1e6), p->epoch, release_mpi, ref);
+        if (rc != MGB_OK)
+            mp_image_unrefp(&ref);
+        if (rc == MGB_STALE)
+            p->epoch = p->be.epoch(p->sess);
+        if (rc == MGB_BUSY)
+            return SUBMIT_BUSY;
+        return rc == MGB_OK ? SUBMIT_OK : SUBMIT_NOT_TAKEN;
+    }
+#endif
     mgb_slot_t slot;
     int rc = p->be.acquire_input(p->sess, &slot);
     if (rc == MGB_BUSY)
@@ -766,6 +897,16 @@ static enum submit_result try_submit(struct priv *p, struct mp_image *mpi)
     return rc == MGB_OK ? SUBMIT_OK : SUBMIT_NOT_TAKEN;
 }
 
+// A reference for use as an attribute donor; the VAAPI stubs (no buffers) are copied as stubs.
+static struct mp_image *donor_ref(struct mp_image *img)
+{
+    if (img->bufs[0])
+        return mp_image_new_ref(img);
+    struct mp_image *stub = mp_image_new_dummy_ref(img);
+    mp_image_copy_attributes(stub, img);
+    return stub;
+}
+
 static void enqueue_frame(struct priv *p, struct mp_image *mpi)
 {
     double pts = mpi->pts;
@@ -780,11 +921,19 @@ static void enqueue_frame(struct priv *p, struct mp_image *mpi)
         prev->dur = half;
         prev->dur_known = true;
         struct entry *mid = queue_push(p, E_MID, p->prev_pts + half, half);
-        mid->donor = mp_image_new_ref(entry_src(prev));
+        mid->donor = donor_ref(entry_src(prev));
         p->last_half = half;
     }
     struct entry *orig = queue_push(p, E_ORIG, pts, 0);
     if (p->scaled) {
+        if (mpi->imgfmt == IMGFMT_VAAPI) {
+            // Attributes only, and no reference to the decoder surface: queued entries must not pin the decoder's
+            // (small) surface pool. The backend holds its own reference until it has blitted the surface.
+            struct mp_image *stub = mp_image_new_dummy_ref(mpi);
+            mp_image_copy_attributes(stub, mpi);
+            mp_image_unrefp(&mpi);
+            mpi = stub;
+        }
         orig->donor = mpi;      // attributes only; the frame comes back converted
     } else {
         orig->img = mpi;
@@ -800,6 +949,16 @@ static bool write_through(struct priv *p, struct mp_image *mpi)
 {
     if (!mp_pin_in_needs_data(p->f->ppins[1]))
         return false;
+    if (mpi->imgfmt == IMGFMT_VAAPI) {
+        // Pass-through frames are system memory like everything else this filter outputs (no format flips for the VO).
+        struct mp_image *sw = mp_image_hw_download(mpi, NULL);
+        mp_image_unrefp(&mpi);
+        if (!sw) {
+            MP_ERR(p, "downloading a VAAPI frame failed, dropping it\n");
+            return true;
+        }
+        mpi = sw;
+    }
     p->n_pass++;
     MP_TRACE(p, "pass pts %.6f\n", mpi->pts);
     if (p->overloaded && ++p->overload_pass >= p->overload_pass_target) {
@@ -952,6 +1111,17 @@ static bool read_input(struct priv *p)
         struct mp_image *mpi = frame.data;
         if (!was_held)   // (a held frame was already counted when it was first read)
             preroll_note_read(p, mpi);
+        if (mpi->imgfmt == IMGFMT_VAAPI && !zc_possible(p, mpi)) {
+            // Not usable as a surface (option off, backend without the feature, setup failed, other sub-format).
+            struct mp_image *sw = mp_image_hw_download(mpi, NULL);
+            mp_image_unrefp(&mpi);
+            if (!sw) {
+                MP_ERR(p, "downloading a VAAPI frame failed, dropping it\n");
+                progress = true;
+                continue;
+            }
+            mpi = sw;
+        }
         if (!handle_video(p, mpi)) {
             p->held = mpi;
             break;
@@ -1031,6 +1201,7 @@ static void vf_migraphx_destroy(struct mp_filter *f)
     mp_image_unrefp(&p->held);
     mp_image_unrefp(&p->last_out);
     close_session(p);
+    release_devices(p);
     log_timing(p);
     // The library stays loaded: unloading the GPU runtime is not safe.
 }
@@ -1066,6 +1237,10 @@ static struct mp_filter *vf_migraphx_create(struct mp_filter *parent, void *opti
         goto error;
     mp_autoconvert_add_imgfmt(conv, IMGFMT_NV12, 0);
     mp_autoconvert_add_imgfmt(conv, IMGFMT_P010, 0);
+#if HAVE_VAAPI
+    if (p->opts->zero_copy)
+        mp_autoconvert_add_imgfmt(conv, IMGFMT_VAAPI, 0);   // decoder surfaces are accepted as they are
+#endif
 
     struct mp_filter *dur = mp_compute_frame_duration_create(f);
     if (!dur)
@@ -1093,6 +1268,7 @@ static const m_option_t vf_opts_fields[] = {
     {"compile", OPT_BOOL(compile), OPTDEF_INT(1)},
     {"wait-ready", OPT_BOOL(wait_ready)},
     {"preroll-bypass", OPT_BOOL(preroll_bypass), OPTDEF_INT(1)},
+    {"zero-copy", OPT_BOOL(zero_copy), OPTDEF_INT(1)},
     {0}
 };
 
