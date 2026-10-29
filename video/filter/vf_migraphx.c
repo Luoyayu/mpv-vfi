@@ -61,6 +61,8 @@
 #define STARVE_BUSY_NS      250000000LL  // backend queue full while the output starves this long: GPU too slow
 #define OVERLOAD_PASS_MIN   120          // frames passed through before trying to interpolate again
 #define OVERLOAD_PASS_MAX   960
+#define PREROLL_PACED_FRAMES 2          // consecutive frame-paced reads that end the post-seek pass-through
+#define PREROLL_PACED_RATIO  0.6        // a read this long after the previous one (in source frame durations) is paced
 #define MAX_TIMING_SAMPLES  (1 << 18)
 
 struct migraphx_opts {
@@ -73,6 +75,7 @@ struct migraphx_opts {
     bool bypass_log;
     bool compile;
     bool wait_ready;
+    bool preroll_bypass;
 };
 
 struct backend_api {
@@ -141,6 +144,15 @@ struct priv {
     struct mp_image *last_out;
     struct mp_image *held;    // a frame we could not process yet
     bool eof_pending;
+
+    // After a reset the player may decode from the keyframe before the seek target and throw the frames before the
+    // target away after the filter chain (exact seek). Those frames are pulled as fast as the decoder delivers them,
+    // while played frames are pulled at the frame rate (the VO throttles). Frames read faster than that right after
+    // a reset are passed through instead of being interpolated, until reads are paced.
+    bool preroll;
+    int64_t last_read_ns;
+    int paced_reads;
+    uint64_t n_preroll;
 
     int64_t starve_since;
     bool overloaded;
@@ -801,6 +813,26 @@ static void enter_overload(struct priv *p)
 }
 
 // Returns true when mpi was consumed (queued, written or dropped), false when it must wait (held).
+static void preroll_note_read(struct priv *p, struct mp_image *mpi)
+{
+    if (!p->preroll)
+        return;
+    int64_t now = mp_time_ns();
+    double dur = mpi->pkt_duration > 0 ? mpi->pkt_duration : mpi->nominal_fps > 0 ? 1.0 / mpi->nominal_fps : 0.04;
+    if (p->last_read_ns) {
+        if ((now - p->last_read_ns) * 1e-9 >= dur * PREROLL_PACED_RATIO)
+            p->paced_reads++;
+        else
+            p->paced_reads = 0;
+        if (p->paced_reads >= PREROLL_PACED_FRAMES) {
+            p->preroll = false;
+            MP_DBG(p, "reads are paced after %" PRIu64 " fast frames since the reset, interpolating from pts %.6f\n",
+                   p->n_preroll, mpi->pts);
+        }
+    }
+    p->last_read_ns = now;
+}
+
 static bool handle_video(struct priv *p, struct mp_image *mpi)
 {
     if (mpi->pts == MP_NOPTS_VALUE)
@@ -821,7 +853,10 @@ static bool handle_video(struct priv *p, struct mp_image *mpi)
     }
 
     bool active = false;
-    if (p->sess && !p->pass_reason && !p->overloaded)
+    if (p->preroll && !p->overloaded && p->sess && !p->pass_reason) {
+        p->n_preroll++;
+        MP_TRACE(p, "preroll pass pts %.6f\n", mpi->pts);
+    } else if (p->sess && !p->pass_reason && !p->overloaded)
         active = p->be.state(p->sess) == MGB_STATE_READY;
 
     if (!active) {
@@ -879,6 +914,7 @@ static bool read_input(struct priv *p)
         if (p->eof_pending)
             break;
         struct mp_frame frame = MP_NO_FRAME;
+        bool was_held = p->held != NULL;
         if (p->held) {
             frame = MAKE_FRAME(MP_FRAME_VIDEO, p->held);
             p->held = NULL;
@@ -904,6 +940,8 @@ static bool read_input(struct priv *p)
             continue;
         }
         struct mp_image *mpi = frame.data;
+        if (!was_held)   // (a held frame was already counted when it was first read)
+            preroll_note_read(p, mpi);
         if (!handle_video(p, mpi)) {
             p->held = mpi;
             break;
@@ -961,6 +999,10 @@ static void vf_migraphx_reset(struct mp_filter *f)
         p->overload_pass_target = 0;
     }
     p->n_resets++;
+    p->preroll = p->opts->preroll_bypass && !p->opts->wait_ready;
+    p->last_read_ns = 0;
+    p->paced_reads = 0;
+    p->n_preroll = 0;
     if (p->sess) {
         uint32_t old = p->epoch;
         p->epoch = p->be.reset(p->sess);
@@ -1040,6 +1082,7 @@ static const m_option_t vf_opts_fields[] = {
     {"bypass-log", OPT_BOOL(bypass_log), OPTDEF_INT(1)},
     {"compile", OPT_BOOL(compile), OPTDEF_INT(1)},
     {"wait-ready", OPT_BOOL(wait_ready)},
+    {"preroll-bypass", OPT_BOOL(preroll_bypass), OPTDEF_INT(1)},
     {0}
 };
 
