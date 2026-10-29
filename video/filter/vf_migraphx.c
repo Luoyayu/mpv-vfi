@@ -628,7 +628,17 @@ static void fill_entry(struct priv *p, struct entry *e, const mgb_result_t *r)
     }
     memcpy_pic(out->planes[0], r->y, r->width, r->height, out->stride[0], r->y_stride);
     memcpy_pic(out->planes[1], r->uv, r->width, r->height / 2, out->stride[1], r->uv_stride);
-    mp_image_copy_attributes(out, entry_src(e));
+    struct mp_image *src = entry_src(e);
+    mp_image_copy_attributes(out, src);
+    if (out->w != src->w || out->h != src->h) {
+        // The backend downscaled the frame (wider than 1920): the source crop is in source pixels.
+        const struct mp_rect c = src->params.crop;
+        out->params.crop = (struct mp_rect){
+            (int)((int64_t)c.x0 * out->w / src->w), (int)((int64_t)c.y0 * out->h / src->h),
+            (int)((int64_t)c.x1 * out->w / src->w), (int)((int64_t)c.y1 * out->h / src->h)};
+        if (!mp_image_crop_valid(&out->params))
+            out->params.crop = (struct mp_rect){0, 0, out->w, out->h};
+    }
     e->img = out;
     mp_image_unrefp(&e->donor);
     e->filled = true;
