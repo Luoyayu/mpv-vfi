@@ -491,6 +491,9 @@ static void close_session(struct priv *p)
                    st.submitted, st.pairs, st.dropped_frames, st.dropped_results, st.busy, st.scene_cuts,
                    st.last_pair_ms, st.avg_pair_ms, st.max_pair_ms, st.plan);
         }
+        if (mp_msg_test(p->log, MSGL_DEBUG) && st.va_input)
+            MP_DBG(p, "zero-copy input: %" PRIu64 " blits, worker time per frame (blit + wait for decode) avg %.3f max %.3f ms\n",
+                   st.va_blits, st.avg_blit_ms, st.max_blit_ms);
         p->be.close(p->sess);   // bounded: waits for the pair in flight
         p->sess = NULL;
     }
